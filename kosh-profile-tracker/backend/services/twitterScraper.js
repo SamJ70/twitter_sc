@@ -1,7 +1,6 @@
 // backend/services/twitterScraper.js
-// Multi-strategy robust Twitter scraper (desktop -> mobile -> nitter fallbacks)
-// Exports: scrapeProfile(handle, options)
-// Put this file in backend/services/twitterScraper.js
+// IMPROVED Multi-strategy robust Twitter scraper with better tweet extraction
+// Replace your current twitterScraper.js with this file
 
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
@@ -10,52 +9,60 @@ const path = require('path');
 puppeteer.use(StealthPlugin());
 
 /**
+ * Enhanced scrapeProfile function with better tweet extraction
  * Options:
  * - lookbackDays: number (default 365)
- * - maxScrolls: number (default 1000)      -> maximum scroll iterations per mode
- * - timeoutMs: number (default 600000)     -> overall timeout across modes (ms)
- * - noNewThreshold: number (default 8)     -> stop if no new tweets for this many scrolls
- * - permalinkEnrichment: boolean (default false) -> if true, visits each tweet permalink to get exact counts/time
- * - nitterInstances: array (optional)      -> list of nitter base urls to try as fallback
+ * - maxScrolls: number (default 1000)
+ * - timeoutMs: number (default 600000)
+ * - noNewThreshold: number (default 8)
+ * - minTweets: number (default 50)
  */
 async function scrapeProfile(handle, options = {}) {
   const lookbackDays = options.lookbackDays ?? 365;
   const maxScrolls = options.maxScrolls ?? 1000;
   const timeoutMs = options.timeoutMs ?? 600000; // 10 minutes
   const noNewThreshold = options.noNewThreshold ?? 8;
-  const permalinkEnrichment = options.permalinkEnrichment ?? false;
-  const customNitter = Array.isArray(options.nitterInstances) ? options.nitterInstances : null;
+  const minTweets = options.minTweets ?? 50;
 
   const DEBUG_DIR = path.join(__dirname, '../reports');
   if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
 
-  const NITTER_INSTANCES = customNitter || [
+  // Updated Nitter instances (more reliable ones)
+  const NITTER_INSTANCES = [
+    'https://nitter.poast.org',
+    'https://nitter.privacydev.net',
     'https://nitter.net',
-    'https://nitter.snopyta.org',
-    'https://nitter.1d4.us',
-    'https://nitter.eu', // may or may not be live
+    'https://nitter.unixfox.eu',
+    'https://nitter.42l.fr'
   ];
 
   let browser;
   const startTime = Date.now();
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // Normalizes counts like "1,234" or "1.2K" into integer
+  // Enhanced count normalization
   function normalizeCount(raw) {
-    if (raw === null || raw === undefined) return 0;
-    const s = String(raw).trim();
-    if (!s) return 0;
+    if (raw === null || raw === undefined || raw === '') return 0;
+    const s = String(raw).trim().toLowerCase();
+    if (!s || s === '0') return 0;
+    
+    // Remove commas and spaces
     const cleaned = s.replace(/,/g, '').replace(/\s/g, '');
-    const m = cleaned.match(/^([\d,.]+)([KMkMmBb])?$/);
-    if (!m) {
+    
+    // Handle K, M, B suffixes
+    const match = cleaned.match(/^([\d,.]+)([kmb])?$/i);
+    if (!match) {
       const digits = cleaned.replace(/[^\d.]/g, '');
-      return digits ? Math.round(Number(digits)) : 0;
+      return digits ? Math.round(parseFloat(digits)) : 0;
     }
-    let num = parseFloat(m[1].replace(/,/g, ''));
-    const suf = (m[2] || '').toUpperCase();
-    if (suf === 'K') num *= 1e3;
-    if (suf === 'M') num *= 1e6;
-    if (suf === 'B') num *= 1e9;
+    
+    let num = parseFloat(match[1]);
+    const suffix = (match[2] || '').toLowerCase();
+    
+    if (suffix === 'k') num *= 1000;
+    else if (suffix === 'm') num *= 1000000;
+    else if (suffix === 'b') num *= 1000000000;
+    
     return Math.round(num);
   }
 
@@ -65,148 +72,287 @@ async function scrapeProfile(handle, options = {}) {
       const html = await page.content();
       const file = path.join(DEBUG_DIR, `snapshot_${handle}_${tag}_${Date.now()}.html`);
       fs.writeFileSync(file, html, 'utf-8');
-      console.log(`⚠️ Saved debug snapshot: ${file}`);
+      console.log(`📸 Saved snapshot: ${path.basename(file)}`);
     } catch (e) { /* ignore */ }
   }
 
-  // Helper to extract tweets from a page. It tries to be markup-agnostic:
-  // finds anchors with /status/ and reads a containing element's text/time/metrics.
-  async function extractBatchFromPage(page) {
-    return await page.evaluate(() => {
-      const out = [];
-      const anchors = Array.from(document.querySelectorAll('a[href*="/status/"]'));
-      const uniq = new Set();
-      anchors.forEach(a => {
-        const href = a.href || '';
-        if (!href.includes('/status/')) return;
-        if (uniq.has(href)) return;
-        uniq.add(href);
-        const container = a.closest('article') || a.closest('div') || a.parentElement;
-        if (!container) return;
-        const timeEl = container.querySelector('time') || document.querySelector('time');
-        const time = timeEl ? timeEl.getAttribute('datetime') : '';
-        const textEl = container.querySelector('[data-testid="tweetText"]') || container.querySelector('div[lang]') || container;
-        const text = textEl ? (textEl.innerText || '').trim() : '';
-        const replies = (container.querySelector('[data-testid="reply"]') || {}).textContent || '';
-        const retweets = (container.querySelector('[data-testid="retweet"]') || {}).textContent || '';
-        const likes = (container.querySelector('[data-testid="like"]') || {}).textContent || '';
-        const views = (container.querySelector('[data-testid="views"]') || {}).textContent || '';
-        const hasImage = !!container.querySelector('img[src*="/media/"], picture');
-        const hasVideo = !!container.querySelector('video, [data-testid="videoPlayer"]');
-        const placeAnchor = container.querySelector('a[href*="/maps"], a[href*="/places/"], a[href*="google.com/maps"]');
-        const placeName = placeAnchor ? (placeAnchor.textContent || '').trim() : '';
-        const coordLink = placeAnchor ? (placeAnchor.href || '') : '';
-        const urls = Array.from(container.querySelectorAll('a[href^="http"]')).map(x => x.href);
-        out.push({ permalink: href, text, time, replies, retweets, likes, views, hasImage, hasVideo, placeName, coordLink, urls });
-      });
-      return out;
-    });
+  // ENHANCED tweet extraction with multiple selector strategies
+  async function extractTweetsFromPage(page, source = 'twitter') {
+    return await page.evaluate((src) => {
+      const tweets = [];
+      const seen = new Set();
+
+      // Helper to safely get text
+      const getText = (el, selector) => {
+        if (!el) return '';
+        const found = selector ? el.querySelector(selector) : el;
+        return found ? (found.textContent || found.innerText || '').trim() : '';
+      };
+
+      // Helper to get attribute
+      const getAttr = (el, selector, attr) => {
+        if (!el) return '';
+        const found = selector ? el.querySelector(selector) : el;
+        return found ? (found.getAttribute(attr) || '') : '';
+      };
+
+      if (src === 'nitter') {
+        // NITTER extraction (cleaner HTML structure)
+        const tweetDivs = document.querySelectorAll('.timeline-item');
+        
+        tweetDivs.forEach(item => {
+          try {
+            // Get tweet link for ID
+            const linkEl = item.querySelector('.tweet-link');
+            const href = linkEl ? linkEl.href : '';
+            if (!href || seen.has(href)) return;
+            seen.add(href);
+
+            // Extract data from Nitter's clean structure
+            const textEl = item.querySelector('.tweet-content');
+            const text = getText(textEl);
+            
+            const timeEl = item.querySelector('.tweet-date a');
+            const timeStr = getAttr(timeEl, null, 'title') || getText(timeEl);
+            
+            // Stats from Nitter
+            const stats = item.querySelectorAll('.icon-container');
+            let replies = 0, retweets = 0, likes = 0;
+            
+            stats.forEach(stat => {
+              const statText = getText(stat);
+              const iconClass = stat.querySelector('[class*="icon-"]')?.className || '';
+              
+              if (iconClass.includes('comment')) replies = parseInt(statText.replace(/\D/g, '')) || 0;
+              else if (iconClass.includes('retweet')) retweets = parseInt(statText.replace(/\D/g, '')) || 0;
+              else if (iconClass.includes('heart')) likes = parseInt(statText.replace(/\D/g, '')) || 0;
+            });
+
+            // Media detection
+            const hasImage = !!item.querySelector('.attachment.image, img.still-image');
+            const hasVideo = !!item.querySelector('.attachment.video, video');
+            
+            // Location data
+            const locationEl = item.querySelector('.tweet-geo');
+            const placeName = locationEl ? getText(locationEl) : '';
+
+            tweets.push({
+              permalink: href,
+              text: text,
+              time: timeStr,
+              replies: String(replies),
+              retweets: String(retweets),
+              likes: String(likes),
+              views: '0',
+              hasImage: hasImage,
+              hasVideo: hasVideo,
+              placeName: placeName,
+              coordLink: '',
+              urls: Array.from(item.querySelectorAll('a[href^="http"]')).map(a => a.href)
+            });
+          } catch (e) {
+            console.error('Error extracting Nitter tweet:', e);
+          }
+        });
+
+      } else {
+        // TWITTER/X extraction with multiple strategies
+        
+        // Strategy 1: Article elements (most reliable for new Twitter)
+        const articles = document.querySelectorAll('article[data-testid="tweet"]');
+        
+        articles.forEach(article => {
+          try {
+            // Get permalink
+            const timeLink = article.querySelector('time')?.parentElement;
+            const href = timeLink ? timeLink.href : '';
+            if (!href || !href.includes('/status/') || seen.has(href)) return;
+            seen.add(href);
+
+            // Text content - try multiple selectors
+            const textEl = article.querySelector('[data-testid="tweetText"]') ||
+                          article.querySelector('[lang]') ||
+                          article.querySelector('.css-1jxf684');
+            const text = getText(textEl);
+
+            // Time
+            const timeEl = article.querySelector('time');
+            const time = timeEl ? (timeEl.getAttribute('datetime') || getText(timeEl)) : '';
+
+            // Engagement metrics with multiple fallback selectors
+            const getMetric = (testId) => {
+              const el = article.querySelector(`[data-testid="${testId}"]`);
+              if (!el) return '0';
+              const text = getText(el);
+              // Extract just the number, ignoring labels
+              const match = text.match(/[\d,.]+[KMB]?/i);
+              return match ? match[0] : '0';
+            };
+
+            const replies = getMetric('reply');
+            const retweets = getMetric('retweet');
+            const likes = getMetric('like');
+            const views = getMetric('views') || getMetric('analytics');
+
+            // Media detection
+            const hasImage = !!article.querySelector('[data-testid="tweetPhoto"], img[src*="media"]');
+            const hasVideo = !!article.querySelector('[data-testid="videoPlayer"], video');
+
+            // Links
+            const urls = Array.from(article.querySelectorAll('a[href^="http"]'))
+              .map(a => a.href)
+              .filter(url => !url.includes('twitter.com') && !url.includes('x.com'));
+
+            // Location/coordinates
+            const locationLink = article.querySelector('a[href*="/maps"], a[href*="google.com/maps"]');
+            const placeName = locationLink ? getText(locationLink) : '';
+            const coordLink = locationLink ? locationLink.href : '';
+
+            tweets.push({
+              permalink: href,
+              text: text,
+              time: time,
+              replies: replies,
+              retweets: retweets,
+              likes: likes,
+              views: views,
+              hasImage: hasImage,
+              hasVideo: hasVideo,
+              placeName: placeName,
+              coordLink: coordLink,
+              urls: urls
+            });
+
+          } catch (e) {
+            console.error('Error extracting tweet from article:', e);
+          }
+        });
+
+        // Strategy 2: Fallback for older Twitter HTML or mobile
+        if (tweets.length === 0) {
+          const tweetDivs = document.querySelectorAll('[data-testid="cellInnerDiv"]');
+          
+          tweetDivs.forEach(div => {
+            try {
+              const link = div.querySelector('a[href*="/status/"]');
+              const href = link ? link.href : '';
+              if (!href || seen.has(href)) return;
+              seen.add(href);
+
+              const text = getText(div.querySelector('[lang]') || div);
+              const time = getAttr(div, 'time', 'datetime');
+              
+              tweets.push({
+                permalink: href,
+                text: text,
+                time: time,
+                replies: '0',
+                retweets: '0',
+                likes: '0',
+                views: '0',
+                hasImage: !!div.querySelector('img[src*="media"]'),
+                hasVideo: !!div.querySelector('video'),
+                placeName: '',
+                coordLink: '',
+                urls: []
+              });
+
+            } catch (e) {
+              console.error('Error in fallback extraction:', e);
+            }
+          });
+        }
+      }
+
+      return tweets;
+    }, source);
   }
 
-  // Enrich a tweet by visiting its permalink (expensive). Used optionally when counts are missing.
-  async function enrichTweetFromPermalink(page, tweet) {
-    if (!tweet || !tweet.permalink) return tweet;
-    try {
-      await page.goto(tweet.permalink, { waitUntil: 'networkidle2', timeout: 30000 });
-      // try to extract canonical metrics and timestamp
-      const enriched = await page.evaluate(() => {
-        const getText = s => document.querySelector(s) ? document.querySelector(s).textContent.trim() : '';
-        const timeEl = document.querySelector('time');
-        const time = timeEl ? timeEl.getAttribute('datetime') : '';
-        const likes = getText('[data-testid="like"]') || getText('div[data-testid="like"]') || '';
-        const retweets = getText('[data-testid="retweet"]') || getText('div[data-testid="retweet"]') || '';
-        const replies = getText('[data-testid="reply"]') || getText('div[data-testid="reply"]') || '';
-        return { time, likes, retweets, replies };
-      });
-      tweet.time = enriched.time || tweet.time;
-      tweet.likes = normalizeCount(enriched.likes || tweet.likes || 0);
-      tweet.retweets = normalizeCount(enriched.retweets || tweet.retweets || 0);
-      tweet.replies = normalizeCount(enriched.replies || tweet.replies || 0);
-    } catch (e) {
-      // ignore permalink errors
-    }
-    return tweet;
-  }
-
-  // Core extraction loop for a single Puppeteer page (desktop or mobile or nitter)
-  async function runExtractionOnPage(page, modeLabel = 'desktop', isNitter = false) {
+  // ENHANCED scroll and extraction loop
+  async function runExtractionLoop(page, modeLabel = 'desktop', isNitter = false) {
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - lookbackDays);
 
     const seen = new Set();
     const tweets = [];
     let reachedCutoff = false;
-    let scrolls = 0;
+    let scrollCount = 0;
     let consecutiveNoNew = 0;
     let prevCount = 0;
 
-    while (!reachedCutoff && scrolls < maxScrolls) {
-      scrolls++;
+    console.log(`🔄 Starting extraction loop for ${modeLabel}...`);
 
-      // global timeout
+    while (!reachedCutoff && scrollCount < maxScrolls && consecutiveNoNew < noNewThreshold) {
+      scrollCount++;
+
+      // Check global timeout
       if (Date.now() - startTime > timeoutMs) {
-        console.warn(`⏳ global timeout reached (${timeoutMs}ms) while scraping ${handle} on ${modeLabel}`);
+        console.warn(`⏰ Global timeout reached at scroll ${scrollCount}`);
         break;
       }
 
-      // get a batch and process
-      let batch = [];
       try {
-        batch = await extractBatchFromPage(page);
-      } catch (e) {
-        batch = [];
-      }
+        // Extract tweets
+        const source = isNitter ? 'nitter' : 'twitter';
+        const batch = await extractTweetsFromPage(page, source);
 
-      // If no batch, try some alternative stimuli to load tweets
-      if (!batch || batch.length === 0) {
-        // various scroll/jump strategies
-        try { await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.8)); } catch(e){}
-        await sleep(600);
-        try { await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)); } catch(e){}
-        await sleep(600);
-        // re-evaluate batch after stimuli
-        try { batch = await extractBatchFromPage(page); } catch(e){ batch = []; }
-      }
-
-      // process the batch items
-      if (Array.isArray(batch) && batch.length) {
+        // Process batch
         for (const t of batch) {
-          const key = t.permalink || (t.time + '|' + (t.text || '').slice(0, 80));
+          const key = t.permalink || `${t.time}|${t.text.slice(0, 50)}`;
           if (seen.has(key)) continue;
           seen.add(key);
 
-          // parse numbers
+          // Normalize engagement numbers
           const likes = normalizeCount(t.likes);
           const retweets = normalizeCount(t.retweets);
           const replies = normalizeCount(t.replies);
           const views = normalizeCount(t.views);
 
-          // parse date
+          // Parse date
           let dateObj = null;
-          try { dateObj = t.time ? new Date(t.time) : null; } catch(e) { dateObj = null; }
+          try {
+            if (t.time) {
+              dateObj = new Date(t.time);
+              if (isNaN(dateObj.getTime())) dateObj = null;
+            }
+          } catch (e) {
+            dateObj = null;
+          }
 
-          // cutoff check
+          // Check cutoff
           if (dateObj && dateObj < cutoffDate) {
             reachedCutoff = true;
             continue;
           }
 
-          // coords heuristics
+          // Extract coordinates if available
           let coordinates = null;
           if (t.coordLink) {
-            const m = t.coordLink.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
-            if (m) coordinates = { lat: Number(m[1]), lon: Number(m[2]), source: t.coordLink };
-            else {
-              const m2 = t.coordLink.match(/q=(-?\d+\.\d+),(-?\d+\.\d+)/);
-              if (m2) coordinates = { lat: Number(m2[1]), lon: Number(m2[2]), source: t.coordLink };
+            const coordMatch = t.coordLink.match(/[@?](-?\d+\.\d+),(-?\d+\.\d+)/);
+            if (coordMatch) {
+              coordinates = {
+                lat: parseFloat(coordMatch[1]),
+                lon: parseFloat(coordMatch[2]),
+                source: t.coordLink
+              };
             }
           }
 
+          // Extract tweet ID
+          let tweetId = '';
+          if (t.permalink) {
+            const idMatch = t.permalink.match(/status\/(\d+)/);
+            if (idMatch) tweetId = idMatch[1];
+          }
+
           tweets.push({
-            id: t.permalink ? (t.permalink.match(/status\/(\d+)/) ? (t.permalink.match(/status\/(\d+)/)[1]) : t.permalink) : '',
+            id: tweetId,
             text: t.text || '',
             time: dateObj ? dateObj.toISOString() : (t.time || ''),
-            likes, retweets, replies, views,
+            likes,
+            retweets,
+            replies,
+            views,
             hasImage: !!t.hasImage,
             hasVideo: !!t.hasVideo,
             coords: coordinates,
@@ -215,224 +361,403 @@ async function scrapeProfile(handle, options = {}) {
             permalink: t.permalink || ''
           });
         }
+
+        // Check if we found new tweets
+        const currCount = tweets.length;
+        if (currCount > prevCount) {
+          consecutiveNoNew = 0;
+          prevCount = currCount;
+          console.log(`📊 ${modeLabel} scroll ${scrollCount}: ${currCount} tweets collected (new: ${batch.length})`);
+        } else {
+          consecutiveNoNew++;
+          console.log(`⚠️ ${modeLabel} scroll ${scrollCount}: No new tweets (${consecutiveNoNew}/${noNewThreshold})`);
+        }
+
+        // Save snapshot periodically
+        if (scrollCount % 15 === 0) {
+          await saveSnapshot(page, `${modeLabel}_s${scrollCount}`);
+        }
+
+        // Stop if we have enough tweets and hit threshold
+        if (tweets.length >= minTweets && consecutiveNoNew >= noNewThreshold) {
+          console.log(`✅ Collected ${tweets.length} tweets, stopping`);
+          break;
+        }
+
+        if (reachedCutoff) {
+          console.log(`📅 Reached date cutoff`);
+          break;
+        }
+
+        // Scroll strategies
+        try {
+          // Random scroll amount for more natural behavior
+          const scrollAmount = 600 + Math.floor(Math.random() * 400);
+          await page.evaluate((amount) => {
+            window.scrollBy(0, amount);
+          }, scrollAmount);
+          
+          await sleep(800 + Math.floor(Math.random() * 400));
+
+          // Occasionally scroll to bottom
+          if (scrollCount % 5 === 0) {
+            await page.evaluate(() => {
+              window.scrollTo(0, document.body.scrollHeight);
+            });
+            await sleep(1000);
+          }
+
+        } catch (e) {
+          console.warn(`Scroll error: ${e.message}`);
+        }
+
+      } catch (error) {
+        console.error(`Error in extraction loop at scroll ${scrollCount}:`, error.message);
+        await sleep(2000);
       }
+    }
 
-      // new count detection
-      const currCount = tweets.length;
-      if (currCount > prevCount) {
-        consecutiveNoNew = 0;
-        prevCount = currCount;
-      } else {
-        consecutiveNoNew++;
-      }
-
-      console.log(`ℹ️ ${modeLabel} scroll #${scrolls} done — tweets collected so far: ${tweets.length} (noNew=${consecutiveNoNew})`);
-
-      // save occasional snapshot for debugging
-      if (scrolls % 12 === 0) {
-        await saveSnapshot(page, `${modeLabel}_scroll${scrolls}`);
-      }
-
-      // stopping heuristics
-      if (consecutiveNoNew >= noNewThreshold) {
-        console.log(`ℹ️ No new tweets after ${consecutiveNoNew} scrolls on ${modeLabel} — stopping extraction`);
-        break;
-      }
-      if (reachedCutoff) {
-        console.log(`ℹ️ Reached date cutoff while scraping ${modeLabel}`);
-        break;
-      }
-
-      // final polite scroll
-      try { await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.9)); } catch(e){}
-      await sleep(700 + Math.floor(Math.random() * 400));
-    } // end while
-
+    console.log(`✅ ${modeLabel} extraction complete: ${tweets.length} tweets`);
     return tweets;
-  } // runExtractionOnPage
+  }
 
-  // Try a single mode: open page, attempt to dismiss overlays (desktop), then run extraction
+  // Try a single mode (desktop/mobile/nitter)
   async function tryMode(url, opts = {}) {
     const modeLabel = opts.label || url;
     const isNitter = !!opts.isNitter;
     const useMobile = !!opts.useMobile;
+    
+    console.log(`🚀 Trying ${modeLabel}...`);
+    
     let page;
     try {
       page = await browser.newPage();
-      // mobile UA for mobile, else desktop UA
+
+      // Set user agent and viewport
       if (useMobile) {
-        await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1');
-        await page.setViewport({ width: 390, height: 844 });
+        await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1');
+        await page.setViewport({ width: 390, height: 844, isMobile: true });
       } else {
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        await page.setViewport({ width: 1200, height: 900 });
+        await page.setViewport({ width: 1280, height: 1024 });
       }
-      page.setDefaultNavigationTimeout(45000);
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
 
-      // Save initial snapshot for debugging
+      // Enhanced page settings
+      await page.setDefaultNavigationTimeout(60000);
+      await page.setDefaultTimeout(30000);
+
+      // Block unnecessary resources to speed up
+      await page.setRequestInterception(true);
+      page.on('request', (req) => {
+        const resourceType = req.resourceType();
+        if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+          req.abort();
+        } else {
+          req.continue();
+        }
+      });
+
+      // Navigate
+      console.log(`🌐 Navigating to ${url}...`);
+      await page.goto(url, { 
+        waitUntil: 'domcontentloaded',
+        timeout: 60000 
+      });
+
+      await sleep(3000);
+
+      // Save initial snapshot
       await saveSnapshot(page, `${modeLabel}_initial`);
 
-      // Try to dismiss overlays on desktop
-      if (!useMobile && !isNitter) {
+      // Remove overlays and popups (Twitter specific)
+      if (!isNitter) {
         try {
           await page.evaluate(() => {
-            // remove dialog overlays and sticky cookie banners
-            document.querySelectorAll('div[role="dialog"], div[aria-modal="true"]').forEach(n => n.remove());
-            document.querySelectorAll('div, section').forEach(el => {
-              try {
-                const style = window.getComputedStyle(el);
-                if ((style.position === 'fixed' || style.position === 'sticky') && el.innerText && /cookie|log in|sign up|login|signup/i.test(el.innerText)) el.remove();
-              } catch(e){}
+            // Remove login modals and dialogs
+            document.querySelectorAll('[role="dialog"], [aria-modal="true"]').forEach(el => el.remove());
+            
+            // Remove cookie banners
+            document.querySelectorAll('[class*="cookie"], [class*="banner"]').forEach(el => {
+              if (el.textContent.toLowerCase().includes('cookie') || 
+                  el.textContent.toLowerCase().includes('accept')) {
+                el.remove();
+              }
             });
-            // try to click "show more" buttons if exist
-            document.querySelectorAll('div[role="button"], button').forEach(b => {
-              try { if ((b.innerText||'').toLowerCase().includes('show more')) b.click(); } catch(e){}
+
+            // Remove sticky overlays
+            document.querySelectorAll('div').forEach(el => {
+              const style = window.getComputedStyle(el);
+              if (style.position === 'fixed' && style.zIndex > 1000) {
+                const text = el.textContent.toLowerCase();
+                if (text.includes('log in') || text.includes('sign up') || text.includes('sign in')) {
+                  el.remove();
+                }
+              }
             });
+
+            // Enable body scroll if disabled
+            document.body.style.overflow = 'auto';
           });
-        } catch (e) {}
+
+          console.log(`🧹 Cleaned up overlays`);
+        } catch (e) {
+          console.warn(`Could not remove overlays: ${e.message}`);
+        }
       }
 
-      // run extraction loop on this page
-      const tweets = await runExtractionOnPage(page, modeLabel, isNitter);
+      // Run extraction
+      const tweets = await runExtractionLoop(page, modeLabel, isNitter);
 
       await page.close();
       return { tweets, success: true };
-    } catch (err) {
+
+    } catch (error) {
+      console.error(`❌ ${modeLabel} failed:`, error.message);
       if (page) {
-        try { await page.close(); } catch (e) {}
+        try {
+          await saveSnapshot(page, `${modeLabel}_error`);
+          await page.close();
+        } catch (e) {}
       }
-      console.warn(`⚠️ tryMode ${modeLabel} failed: ${err && err.message ? err.message : err}`);
-      return { tweets: [], success: false, error: err && err.message ? err.message : String(err) };
+      return { tweets: [], success: false, error: error.message };
     }
   }
 
-  // Start scraping: open browser once, try desktop -> mobile -> nitter list
+  // MAIN EXECUTION
   try {
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`🎯 Starting enhanced Twitter scraping for @${handle}`);
+    console.log(`📅 Looking back ${lookbackDays} days`);
+    console.log(`⏱️ Timeout: ${timeoutMs/1000}s`);
+    console.log(`${'='.repeat(60)}\n`);
+
     browser = await puppeteer.launch({
       headless: 'new',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu'
+        '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process'
       ]
     });
 
-    const desktopUrl = `https://twitter.com/${handle.replace('@','')}`;
-    const mobileUrl = `https://mobile.twitter.com/${handle.replace('@','')}`;
+    const cleanHandle = handle.replace('@', '');
+    let allTweets = [];
+    let bestResult = { tweets: [], success: false };
 
-    // 1) Desktop
-    console.log('ℹ️ Attempting desktop Twitter extraction (may hit login overlay)');
-    const desktopRes = await tryMode(desktopUrl, { label: 'desktop', useMobile: false });
-    if (!desktopRes.success) console.log('ℹ️ Desktop attempt failed; will try mobile and nitter.');
-
-    // If desktop found many tweets, keep them; else try mobile
-    let collected = (desktopRes.tweets || []);
-    if (collected.length < 25) {
-      console.log('ℹ️ Desktop extraction yielded few tweets -> trying mobile.twitter.com fallback (often more accessible)');
-      const mobileRes = await tryMode(mobileUrl, { label: 'mobile', useMobile: true });
-      if (mobileRes.success && (mobileRes.tweets || []).length > collected.length) {
-        collected = mobileRes.tweets;
-      }
-    }
-
-    // If still small or empty, try nitter instances
-    if (!collected.length || collected.length < 50) {
-      console.log('ℹ️ Trying Nitter fallbacks for better HTML-only scraping');
-      for (const inst of NITTER_INSTANCES) {
-        if (Date.now() - startTime > timeoutMs) break;
-        try {
-          const nitterUrl = `${inst.replace(/\/$/, '')}/${handle.replace('@','')}`;
-          const nRes = await tryMode(nitterUrl, { label: `nitter:${inst}`, useMobile: false, isNitter: true });
-          if (nRes.success && nRes.tweets && nRes.tweets.length > collected.length) {
-            collected = nRes.tweets;
-          }
-          // if we've got a lot already, stop trying more nitter instances
-          if (collected.length >= 200) break;
-        } catch (e) {
-          // ignore and try next instance
-        }
-      }
-    }
-
-    // If permalink enrichment requested, visit permalinks for missing counts (expensive)
-    if (permalinkEnrichment && collected.length && Date.now() - startTime < timeoutMs) {
-      console.log('ℹ️ Starting permalink enrichment (this is slower but fills exact counts)');
-      const pagePerm = await browser.newPage();
-      await pagePerm.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
-      for (let i = 0; i < collected.length; i++) {
-        if (Date.now() - startTime > timeoutMs) break;
-        const t = collected[i];
-        if ((!t.likes || !t.retweets || !t.replies) && t.permalink) {
-          try {
-            await enrichTweetFromPermalink(pagePerm, t);
-            // small polite wait
-            await sleep(400 + Math.floor(Math.random()*300));
-          } catch(e){}
-        }
-      }
-      try { await pagePerm.close(); } catch(e){}
-    }
-
-    // Sort tweets by time desc then remove duplicates
-    const uniqMap = new Map();
-    for (const t of collected) {
-      const key = t.permalink || (t.id || '') || (t.time + '|' + (t.text||'').slice(0,120));
-      if (!uniqMap.has(key)) uniqMap.set(key, t);
-    }
-    const finalTweets = Array.from(uniqMap.values()).sort((a,b) => {
-      const ta = a.time ? new Date(a.time).getTime() : 0;
-      const tb = b.time ? new Date(b.time).getTime() : 0;
-      return tb - ta;
-    });
-
-    // DONE — try to fetch name/followers by a light separate page if possible
-    let name = handle.replace('@',''), followers = 0, following = 0, profileImage = '';
-    try {
-      const p = await browser.newPage();
-      await p.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
-      await p.goto(desktopUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-      const base = await p.evaluate(() => {
-        const get = s => document.querySelector(s) ? document.querySelector(s).textContent.trim() : '';
-        const img = (document.querySelector('img[src*="profile_images"]') || {}).src || '';
-        return {
-          name: get('[data-testid="UserName"] span') || get('h2[role="heading"]') || '',
-          followersText: get('a[href$="/followers"] span') || get('a[href$="/followers"]') || '',
-          followingText: get('a[href$="/following"] span') || get('a[href$="/following"]') || '',
-          profileImage: img
-        };
+    // Strategy 1: Try Nitter instances first (most reliable, no auth needed)
+    console.log(`\n📡 PHASE 1: Trying Nitter instances...\n`);
+    
+    for (const instance of NITTER_INSTANCES) {
+      if (Date.now() - startTime > timeoutMs * 0.6) break;
+      
+      const nitterUrl = `${instance}/${cleanHandle}`;
+      const result = await tryMode(nitterUrl, {
+        label: `nitter:${new URL(instance).hostname}`,
+        isNitter: true,
+        useMobile: false
       });
-      followers = normalizeCount(base.followersText || '0');
-      following = normalizeCount(base.followingText || '0');
-      name = base.name || name;
-      profileImage = base.profileImage || '';
-      try { await p.close(); } catch(e){}
-    } catch (e) { /* ignore */ }
 
-    return {
-      name: name || handle.replace('@',''),
-      handle: `@${handle.replace('@','')}`,
+      if (result.success && result.tweets.length > bestResult.tweets.length) {
+        bestResult = result;
+        console.log(`✨ New best result: ${result.tweets.length} tweets from Nitter`);
+      }
+
+      // If we got good results from Nitter, use them
+      if (bestResult.tweets.length >= minTweets) {
+        console.log(`✅ Nitter provided ${bestResult.tweets.length} tweets - using this data`);
+        allTweets = bestResult.tweets;
+        break;
+      }
+
+      await sleep(2000);
+    }
+
+    // Strategy 2: Try Twitter mobile if Nitter didn't work well
+    if (allTweets.length < minTweets && Date.now() - startTime < timeoutMs * 0.8) {
+      console.log(`\n📱 PHASE 2: Trying mobile Twitter...\n`);
+      
+      const mobileUrl = `https://mobile.twitter.com/${cleanHandle}`;
+      const mobileResult = await tryMode(mobileUrl, {
+        label: 'mobile-twitter',
+        useMobile: true,
+        isNitter: false
+      });
+
+      if (mobileResult.success && mobileResult.tweets.length > allTweets.length) {
+        console.log(`✨ Mobile Twitter found ${mobileResult.tweets.length} tweets`);
+        allTweets = mobileResult.tweets;
+      }
+    }
+
+    // Strategy 3: Try desktop Twitter as last resort
+    if (allTweets.length < minTweets && Date.now() - startTime < timeoutMs * 0.9) {
+      console.log(`\n🖥️ PHASE 3: Trying desktop Twitter...\n`);
+      
+      const desktopUrl = `https://twitter.com/${cleanHandle}`;
+      const desktopResult = await tryMode(desktopUrl, {
+        label: 'desktop-twitter',
+        useMobile: false,
+        isNitter: false
+      });
+
+      if (desktopResult.success && desktopResult.tweets.length > allTweets.length) {
+        console.log(`✨ Desktop Twitter found ${desktopResult.tweets.length} tweets`);
+        allTweets = desktopResult.tweets;
+      }
+    }
+
+    // Deduplicate and sort tweets
+    const tweetMap = new Map();
+    for (const tweet of allTweets) {
+      const key = tweet.permalink || tweet.id || `${tweet.time}|${tweet.text.slice(0, 100)}`;
+      if (!tweetMap.has(key)) {
+        tweetMap.set(key, tweet);
+      }
+    }
+
+    const finalTweets = Array.from(tweetMap.values())
+      .sort((a, b) => {
+        const timeA = a.time ? new Date(a.time).getTime() : 0;
+        const timeB = b.time ? new Date(b.time).getTime() : 0;
+        return timeB - timeA; // Newest first
+      });
+
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`✅ SCRAPING COMPLETE`);
+    console.log(`📊 Total unique tweets collected: ${finalTweets.length}`);
+    console.log(`⏱️ Time taken: ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+    console.log(`${'='.repeat(60)}\n`);
+
+    // Fetch profile info
+    let profileInfo = {
+      name: cleanHandle,
+      handle: `@${cleanHandle}`,
       bio: '',
       location: '',
       website: '',
       joinDate: '',
-      following,
-      followers,
+      following: 0,
+      followers: 0,
+      verified: false,
+      profileImage: ''
+    };
+
+    // Try to get profile info from a working source
+    try {
+      console.log(`👤 Fetching profile information...`);
+      const profilePage = await browser.newPage();
+      await profilePage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+      
+      // Try Twitter first
+      try {
+        await profilePage.goto(`https://twitter.com/${cleanHandle}`, {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000
+        });
+        await sleep(3000);
+
+        const info = await profilePage.evaluate(() => {
+          const get = (sel) => {
+            const el = document.querySelector(sel);
+            return el ? el.textContent.trim() : '';
+          };
+
+          return {
+            name: get('[data-testid="UserName"] span') || get('h2 span'),
+            bio: get('[data-testid="UserDescription"]'),
+            location: get('[data-testid="UserLocation"]') || get('[data-testid="UserLocation"] span'),
+            website: get('[data-testid="UserUrl"] a'),
+            followersText: get('a[href$="/verified_followers"] span, a[href$="/followers"] span'),
+            followingText: get('a[href$="/following"] span'),
+            profileImage: document.querySelector('img[src*="profile_images"]')?.src || '',
+            verified: !!document.querySelector('[data-testid="icon-verified"], [aria-label*="Verified"]')
+          };
+        });
+
+        if (info.name) {
+          profileInfo.name = info.name;
+          profileInfo.bio = info.bio;
+          profileInfo.location = info.location;
+          profileInfo.website = info.website;
+          profileInfo.followers = normalizeCount(info.followersText);
+          profileInfo.following = normalizeCount(info.followingText);
+          profileInfo.profileImage = info.profileImage;
+          profileInfo.verified = info.verified;
+          console.log(`✅ Profile info fetched from Twitter`);
+        }
+      } catch (e) {
+        console.log(`⚠️ Could not fetch from Twitter, trying Nitter...`);
+        
+        // Try Nitter for profile info
+        for (const instance of NITTER_INSTANCES.slice(0, 2)) {
+          try {
+            await profilePage.goto(`${instance}/${cleanHandle}`, {
+              waitUntil: 'domcontentloaded',
+              timeout: 20000
+            });
+            await sleep(2000);
+
+            const nitterInfo = await profilePage.evaluate(() => {
+              const get = (sel) => {
+                const el = document.querySelector(sel);
+                return el ? el.textContent.trim() : '';
+              };
+
+              return {
+                name: get('.profile-card-fullname'),
+                bio: get('.profile-bio'),
+                location: get('.profile-location'),
+                website: get('.profile-website'),
+                followersText: get('.profile-stat-num[title*="Followers"]'),
+                followingText: get('.profile-stat-num[title*="Following"]'),
+                profileImage: document.querySelector('.profile-card-avatar')?.src || ''
+              };
+            });
+
+            if (nitterInfo.name) {
+              profileInfo.name = nitterInfo.name;
+              profileInfo.bio = nitterInfo.bio;
+              profileInfo.location = nitterInfo.location;
+              profileInfo.website = nitterInfo.website;
+              profileInfo.followers = normalizeCount(nitterInfo.followersText);
+              profileInfo.following = normalizeCount(nitterInfo.followingText);
+              profileInfo.profileImage = nitterInfo.profileImage;
+              console.log(`✅ Profile info fetched from Nitter`);
+              break;
+            }
+          } catch (e2) {
+            continue;
+          }
+        }
+      }
+
+      await profilePage.close();
+    } catch (e) {
+      console.warn(`⚠️ Could not fetch complete profile info: ${e.message}`);
+    }
+
+    // Return complete profile data
+    return {
+      ...profileInfo,
       tweets: finalTweets,
-      verified: !!profileImage,
-      profileImage: profileImage || '',
       accountExists: true,
       protected: false,
       reason: ''
     };
 
-  } catch (err) {
-    console.error('❌ Scraper final error:', err && (err.message || err));
-    throw new Error(`Failed to scrape Twitter profile: ${err && (err.message || err) || 'unknown'}`);
+  } catch (error) {
+    console.error(`\n❌ FATAL ERROR:`, error.message);
+    console.error(error.stack);
+    throw new Error(`Failed to scrape Twitter profile: ${error.message}`);
   } finally {
     if (browser) {
-      try { await browser.close(); } catch (e) {}
+      try {
+        await browser.close();
+        console.log(`🔒 Browser closed`);
+      } catch (e) {}
     }
   }
 }
